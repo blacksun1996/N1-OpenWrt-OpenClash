@@ -1,0 +1,13 @@
+#!/bin/sh
+# Apply after package and image-builder defaults.
+uci -q batch <<'EOF'
+set openclash.config.core_type='Meta'
+set openclash.config.core_version='linux-arm64'
+set openclash.config.enable='0'
+set amlogic.config.amlogic_firmware_repo='https://github.com/blacksun1996/N1-OpenWrt-OpenClash'
+set amlogic.config.amlogic_firmware_tag='N1-OpenClash'
+set amlogic.config.amlogic_firmware_suffix='.img.gz'
+commit openclash
+commit amlogic
+EOF
+exit 0
