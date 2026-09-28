@@ -1,12 +1,16 @@
-name: Build ImmortalWrt-25.12 for armsr_armv8
+name: Build N1 OpenClash
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 1,16 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: n1-openclash-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-25.12
   TZ: Asia/Shanghai
@@ -14,79 +18,141 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Initialize environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo -E apt-get -qq update > /dev/null
-        sudo -E apt-get -qq install -y $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) > /dev/null
-        sudo -E apt-get -qq autoremove --purge > /dev/null
-        sudo -E apt-get -qq clean > /dev/null
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+      - name: Initialize environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            python3-pyelftools rsync swig unzip zlib1g-dev file wget curl jq aria2 \
+            subversion libelf-dev libxml-parser-perl device-tree-compiler \
+            btrfs-progs dosfstools e2fsprogs f2fs-tools parted pigz pv \
+            qemu-utils squashfs-tools u-boot-tools uuid-runtime xfsprogs \
+            zip zstd xz-utils libarchive-tools rename
+          sudo apt-get clean
+          sudo mkdir -p /workdir
+          sudo chown "$USER:$(id -gn)" /workdir
+          df -h
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        git clone $REPO_URL -b $REPO_BRANCH --single-branch --depth=1 openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-        echo "FILE_DATE=$(date +"%Y%m%d")" >> $GITHUB_ENV
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          git clone "$REPO_URL" -b "$REPO_BRANCH" --single-branch --depth=1 openwrt
+          ln -s /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+          echo "RELEASE_TAG=N1-OpenClash_$(date +%Y%m%d-%H%M%S)_${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
-    - name: Update & Install feeds
-      working-directory: ./openwrt
-      run: |
-        ./scripts/feeds update -a
-        bash $GITHUB_WORKSPACE/armsr/armv8/diy/diy.sh
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+      - name: Load config and custom packages
+        working-directory: ./openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/armsr/armv8/N1/.config" .config
+          mkdir -p files
+          cp -a "$GITHUB_WORKSPACE/armsr/armv8/N1/files/." files/
+          chmod 755 files/etc/uci-defaults/99-n1-openclash
+          # Keep online upgrades pointed at the repository running this workflow.
+          sed -i "s|https://github.com/blacksun1996/N1-OpenWrt-OpenClash|https://github.com/$GITHUB_REPOSITORY|g" \
+            files/etc/config/amlogic files/etc/uci-defaults/99-n1-openclash
+          ./scripts/feeds update -a
+          bash "$GITHUB_WORKSPACE/armsr/armv8/diy/diy.sh"
+          ./scripts/feeds install -a
+          make defconfig
+          grep -qx 'CONFIG_PACKAGE_luci-app-openclash=y' .config
+          grep -qx 'CONFIG_TARGET_ROOTFS_TARGZ=y' .config
+          if grep -E '^CONFIG_PACKAGE_((luci-(app|i18n|lib)-)?(docker[^=]*|podman[^=]*|dae[^=]*)|containerd[^=]*|runc|crun|conmon|netavark|aardvark-dns|cni[^=]*|buildah|skopeo)=(y|m)$' .config; then
+            echo '::error::Unexpected proxy or container package enabled'
+            exit 1
+          fi
+          ./scripts/diffconfig.sh > config.buildinfo
 
-    - name: Load N1 custom config
-      run: |
-        rm -rf openwrt/files openwrt/.config
-        mv armsr/armv8/N1/files armsr/armv8/N1/.config openwrt/
-        chmod -R 755 openwrt
+      - name: Download packages
+        working-directory: ./openwrt
+        run: make download -j8
 
-    - name: Download package
-      working-directory: ./openwrt
-      run: |
-        make defconfig
-        make download -j$(( $(nproc) * 2 ))
+      - name: Compile firmware
+        working-directory: ./openwrt
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
 
-    - name: Compile N1 firmware
-      working-directory: ./openwrt
-      run: |
-        make -j$(( $(nproc) + 1 )) || make -j1 V=s
+      - name: Verify rootfs and package manifest
+        working-directory: ./openwrt
+        run: |
+          shopt -s nullglob
+          rootfs=(bin/targets/armsr/armv8/*rootfs.tar.gz)
+          manifests=(bin/targets/armsr/armv8/*.manifest)
+          test "${#rootfs[@]}" -eq 1
+          test "${#manifests[@]}" -gt 0
+          grep -h '^luci-app-openclash ' "${manifests[@]}"
+          if grep -Eh '^((luci-(app|i18n|lib)-)?(docker[^ ]*|podman[^ ]*|dae[^ ]*)|containerd[^ ]*|runc|crun|conmon|netavark|aardvark-dns|cni[^ ]*|buildah|skopeo) ' "${manifests[@]}"; then
+            echo '::error::Forbidden package in firmware'
+            exit 1
+          fi
+          tar -tzf "${rootfs[0]}" > rootfs-files.txt
+          grep -E '^\.?/?etc/openclash/core/clash_meta$' rootfs-files.txt
+          grep -E '^\.?/?etc/uci-defaults/99-n1-openclash$' rootfs-files.txt
 
-    - name: Package N1 firmware
-      uses: ophub/amlogic-s9xxx-openwrt@main
-      with:
-        openwrt_path: openwrt/bin/targets/armsr/armv8/*rootfs.tar.gz
-        openwrt_board: s905d
-        kernel_usage: flippy
-        openwrt_kernel: 6.12.y
-        openwrt_size: 256/1024
-        builder_name: nantayo
+      - name: Package N1 firmware
+        uses: ophub/amlogic-s9xxx-openwrt@e313a4a34cd2ea11c02501ff918f4dc2f1d36147
+        with:
+          openwrt_path: openwrt/bin/targets/armsr/armv8/*rootfs.tar.gz
+          openwrt_board: s905d
+          kernel_usage: flippy
+          openwrt_kernel: 6.12.y
+          openwrt_size: 256/1024
+          openwrt_ip: 192.168.2.2
+          builder_name: ${{ github.repository_owner }}
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@master
-      with:
-        tag_name: OpenWrt_${{ env.FILE_DATE }}
-        files: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
-        body: |
-          首次使用建议全新刷写
-          * 基本信息
-          IP: 192.168.2.2
-          账户: root
-          密码: password
+      - name: Collect release files
+        run: |
+          mkdir -p firmware
+          cp "$PACKAGED_OUTPUTPATH"/*.img.gz firmware/
+          cp openwrt/config.buildinfo openwrt/build-sources.txt firmware/
+          cp openwrt/bin/targets/armsr/armv8/*.manifest firmware/
+          cd firmware
+          sha256sum *.img.gz > sha256sums
 
-    - name: Delete old releases
-      uses: mgz0227/delete-older-releases@master
-      with:
-        keep_latest: 2
-        delete_tags : true
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: N1-OpenClash-${{ github.run_number }}
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish firmware release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: firmware/*
+          fail_on_unmatched_files: true
+          body: |
+            斐讯 N1 / ImmortalWrt 25.12 / OpenClash（内置 ARM64 Meta 内核）
+            已移除 daed、Docker、Podman 及容器运行时；保留 PassWall、Samba4、Amlogic 管理。
+            管理地址：192.168.2.2；网关：192.168.2.1。
+            首次刷写请使用全新配置；导入订阅后再启用 OpenClash，不要同时开启 PassWall。
+            请查看附件中的包清单、源码版本记录和 SHA256 校验值。
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ github.run_number }}
+          path: |
+            openwrt/.config
+            openwrt/config.buildinfo
+            openwrt/build-sources.txt
+            openwrt/build.log
+            openwrt/logs/
+          if-no-files-found: ignore
+          retention-days: 7
